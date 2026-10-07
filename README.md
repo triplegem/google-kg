@@ -35,3 +35,7 @@ than a single "authority score."
     python google_entity_authority.py --input input/entity_queries.csv
     python google_entity_authority.py --limit 10
     python google_entity_authority.py --no-resume
+
+# Resources
+
+    https://github.com/triplegem/google-kg/resources
