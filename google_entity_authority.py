@@ -1,7 +1,6 @@
 """
 
-Measure Google Knowledge Graph / entity resolution signals for a set of
-queries using Google SERP data returned by Serp Api (serpapi.com).
+Measure Google SERP Knowledge Graph/entity-resolution signals using SerpApi (serpapi.com).
 
 """
 
