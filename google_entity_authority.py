@@ -1,11 +1,11 @@
 """
-
-Measure Google SERP Knowledge Graph/entity-resolution signals using SerpApi (serpapi.com).
-
+Measure Google Knowledge Graph / entity resolution signals for a set of
+queries using Google SERP data returned by SerpApi (serpapi.com).
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -13,6 +13,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
 
@@ -27,9 +28,16 @@ if not SERPAPI_API_KEY:
 
 BASE_DIR = "/Benchmarking"
 
-DEFAULT_INPUT_CSV = os.path.join(BASE_DIR, "input", "entity_queries.csv")
+DEFAULT_INPUT_CSV = os.path.join(
+    BASE_DIR,
+    "input",
+    "entity_queries.csv",
+)
+
 DEFAULT_RESULTS_DIR = os.path.join(
-    BASE_DIR, "results", "entity_authority"
+    BASE_DIR,
+    "results",
+    "entity_authority",
 )
 
 TARGET_DOMAIN = "example.com"
@@ -97,15 +105,18 @@ def normalize_url(url):
         return ""
 
     url = str(url).strip()
+
     parsed = urlparse(
         url if "://" in url else "https://" + url
     )
 
     netloc = parsed.netloc.lower()
+
     if netloc.startswith("www."):
         netloc = netloc[4:]
 
     path = parsed.path.rstrip("/").lower()
+
     return netloc + path
 
 
@@ -146,10 +157,34 @@ def url_matches_expected(link, expected):
 
 
 def safe_filename(value):
-    """Create a filesystem-safe filename from a query."""
-    value = re.sub(r"[^\w\s.-]", "", value, flags=re.UNICODE)
-    value = re.sub(r"\s+", "_", value.strip())
-    return value[:150] or "query"
+    """
+    Create a filesystem-safe filename from a query.
+
+    A short hash is appended so different queries that normalize to the
+    same filename cannot overwrite each other's raw JSON.
+    """
+    original = str(value)
+
+    value = re.sub(
+        r"[^\w\s.-]",
+        "",
+        original,
+        flags=re.UNICODE,
+    )
+
+    value = re.sub(
+        r"\s+",
+        "_",
+        value.strip(),
+    )
+
+    digest = hashlib.sha1(
+        original.encode("utf-8")
+    ).hexdigest()[:10]
+
+    base = value[:130] or "query"
+
+    return f"{base}_{digest}"
 
 
 def now_iso():
@@ -161,7 +196,22 @@ def first_nonempty(*values):
     for value in values:
         if value not in (None, "", [], {}):
             return value
+
     return ""
+
+
+def record_key(entity, query, expected_website):
+    """
+    Return a stable key identifying one input record.
+
+    Query alone is not sufficient because the same query can legitimately
+    appear for different entities or expected websites.
+    """
+    return (
+        (entity or "").strip(),
+        (query or "").strip(),
+        (expected_website or "").strip(),
+    )
 
 
 # Input
@@ -175,11 +225,22 @@ def read_queries(path):
 
     Extra columns are ignored.
     """
-    with open(path, newline="", encoding="utf-8-sig") as f:
+    with open(
+        path,
+        newline="",
+        encoding="utf-8-sig",
+    ) as f:
         reader = csv.DictReader(f)
 
-        required = {"Entity", "Query", "Expected Website"}
-        missing = required - set(reader.fieldnames or [])
+        required = {
+            "Entity",
+            "Query",
+            "Expected Website",
+        }
+
+        missing = required - set(
+            reader.fieldnames or []
+        )
 
         if missing:
             raise ValueError(
@@ -190,14 +251,20 @@ def read_queries(path):
         rows = []
 
         for row in reader:
-            query = (row.get("Query") or "").strip()
+            query = (
+                row.get("Query") or ""
+            ).strip()
 
             if not query:
                 continue
 
             rows.append({
-                "Entity": (row.get("Entity") or "").strip(),
+                "Entity": (
+                    row.get("Entity") or ""
+                ).strip(),
+
                 "Query": query,
+
                 "Expected Website": (
                     row.get("Expected Website") or ""
                 ).strip(),
@@ -206,20 +273,35 @@ def read_queries(path):
     return rows
 
 
-def load_done_queries(path):
-    """Return queries already present in an output CSV."""
+def load_done_records(path):
+    """
+    Return input records already present in an output CSV.
+
+    Uses Entity + Query + Expected Website rather than Query alone so that
+    duplicate queries belonging to different entities are not accidentally
+    skipped.
+    """
     if not os.path.exists(path):
         return set()
 
     done = set()
 
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(
+        path,
+        newline="",
+        encoding="utf-8",
+    ) as f:
         reader = csv.DictReader(f)
 
         for row in reader:
-            query = (row.get("Query") or "").strip()
-            if query:
-                done.add(query)
+            key = record_key(
+                row.get("Entity"),
+                row.get("Query"),
+                row.get("Expected Website"),
+            )
+
+            if key[1]:
+                done.add(key)
 
     return done
 
@@ -230,7 +312,10 @@ def get_serp(query):
     """Run one Google search through SerpApi with retries."""
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
         try:
             search = GoogleSearch({
                 "q": query,
@@ -243,23 +328,34 @@ def get_serp(query):
 
             data = search.get_dict()
 
-            if isinstance(data, dict) and data.get("error"):
-                raise RuntimeError(data["error"])
+            if (
+                isinstance(data, dict)
+                and data.get("error")
+            ):
+                raise RuntimeError(
+                    data["error"]
+                )
 
             return data
 
         except Exception as exc:
             last_error = exc
+
             print(
-                f"  ! SERP attempt {attempt}/{MAX_RETRIES} failed: "
+                f"  ! SERP attempt "
+                f"{attempt}/{MAX_RETRIES} failed: "
                 f"{exc}"
             )
 
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF * attempt)
+                time.sleep(
+                    RETRY_BACKOFF * attempt
+                )
 
     raise RuntimeError(
-        f"SERP failed after {MAX_RETRIES} attempts: {last_error}"
+        f"SERP failed after "
+        f"{MAX_RETRIES} attempts: "
+        f"{last_error}"
     )
 
 
@@ -274,75 +370,160 @@ def extract_kg(data):
     KG title can legitimately differ from the query while referring to the
     same entity.
     """
-    kg = data.get("knowledge_graph") or {}
+    kg = data.get(
+        "knowledge_graph"
+    ) or {}
 
     if not isinstance(kg, dict):
         kg = {}
 
-    profiles = kg.get("profiles") or []
+    profiles = kg.get(
+        "profiles"
+    ) or []
 
-    if not isinstance(profiles, list):
+    if not isinstance(
+        profiles,
+        list,
+    ):
         profiles = []
 
     profile_links = []
     profile_names = []
 
     for profile in profiles:
-        if not isinstance(profile, dict):
+        if not isinstance(
+            profile,
+            dict,
+        ):
             continue
 
-        link = profile.get("link") or ""
-        name = profile.get("name") or ""
+        link = profile.get(
+            "link"
+        ) or ""
+
+        name = profile.get(
+            "name"
+        ) or ""
 
         if link:
-            profile_links.append(str(link))
+            profile_links.append(
+                str(link)
+            )
 
         if name:
-            profile_names.append(str(name))
+            profile_names.append(
+                str(name)
+            )
 
-    source = kg.get("source") or {}
+    source = kg.get(
+        "source"
+    ) or {}
 
-    if not isinstance(source, dict):
+    if not isinstance(
+        source,
+        dict,
+    ):
         source = {}
 
-    # Preserve the complete KG object as JSON in the CSV. The raw SERP is
-    # also saved separately, so this is convenient for spreadsheet analysis.
-    raw_kg = json.dumps(
-        kg,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ) if kg else ""
+    # Preserve the complete KG object as JSON in the CSV.
+    # The raw SERP is also saved separately.
+    raw_kg = (
+        json.dumps(
+            kg,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if kg
+        else ""
+    )
 
     return {
-        "KG Present": "Yes" if kg else "No",
-        "KG MID": kg.get("kgmid", ""),
-        "KG Title": kg.get("title", ""),
-        "KG Type": kg.get("type", ""),
-        "KG Entity Type": kg.get("entity_type", ""),
-        "KG Description": kg.get("description", ""),
-        "KG Website": kg.get("website", ""),
+        "KG Present": (
+            "Yes" if kg else "No"
+        ),
+
+        "KG MID": kg.get(
+            "kgmid",
+            "",
+        ),
+
+        "KG Title": kg.get(
+            "title",
+            "",
+        ),
+
+        "KG Type": kg.get(
+            "type",
+            "",
+        ),
+
+        "KG Entity Type": kg.get(
+            "entity_type",
+            "",
+        ),
+
+        "KG Description": kg.get(
+            "description",
+            "",
+        ),
+
+        "KG Website": kg.get(
+            "website",
+            "",
+        ),
+
         "KG Canonical": first_nonempty(
             kg.get("canonical"),
             kg.get("canonical_url"),
         ),
+
         "KG Wikidata": first_nonempty(
             kg.get("wikidata"),
             kg.get("wikidata_id"),
         ),
+
         "KG Wikipedia": first_nonempty(
             kg.get("wikipedia"),
             kg.get("wikipedia_url"),
         ),
-        "KG Image": kg.get("image", ""),
-        "KG Place ID": kg.get("place_id", ""),
-        "KG Search Link": first_nonempty(
-            kg.get("knowledge_graph_search_link"),
-            kg.get("kg_search_link"),
+
+        "KG Image": kg.get(
+            "image",
+            "",
         ),
-        "KG Source": source.get("name", ""),
-        "KG Source Link": source.get("link", ""),
-        "KG Profile Links": " | ".join(profile_links),
-        "KG Profile Names": " | ".join(profile_names),
+
+        "KG Place ID": kg.get(
+            "place_id",
+            "",
+        ),
+
+        "KG Search Link": first_nonempty(
+            kg.get(
+                "knowledge_graph_search_link"
+            ),
+            kg.get(
+                "kg_search_link"
+            ),
+        ),
+
+        "KG Source": source.get(
+            "name",
+            "",
+        ),
+
+        "KG Source Link": source.get(
+            "link",
+            "",
+        ),
+
+        "KG Profile Links": (
+            " | ".join(profile_links)
+        ),
+
+        "KG Profile Names": (
+            " | ".join(profile_names)
+        ),
+
         "KG Raw JSON": raw_kg,
     }
 
@@ -351,71 +532,131 @@ def extract_kg(data):
 
 def extract_organic(data):
     """Extract the top 20 organic URLs and source names."""
-    organic = data.get("organic_results") or []
+    organic = data.get(
+        "organic_results"
+    ) or []
 
     top_urls = []
     top_sources = []
 
     for result in organic[:20]:
-        if not isinstance(result, dict):
+        if not isinstance(
+            result,
+            dict,
+        ):
             continue
 
-        link = result.get("link") or ""
-        source = result.get("source") or ""
+        link = result.get(
+            "link"
+        ) or ""
+
+        source = result.get(
+            "source"
+        ) or ""
 
         if link:
-            top_urls.append(link)
+            top_urls.append(
+                link
+            )
 
         if source:
-            top_sources.append(source)
+            top_sources.append(
+                source
+            )
 
     return {
-        "Top 20 URLs": " | ".join(top_urls),
-        "Top 20 Sources": " | ".join(top_sources),
+        "Top 20 URLs": (
+            " | ".join(top_urls)
+        ),
+
+        "Top 20 Sources": (
+            " | ".join(top_sources)
+        ),
     }
 
 
-def extract_ranks(data, expected_url):
+def extract_ranks(
+    data,
+    expected_url,
+):
     """
     Find the first target-domain result and first expected-URL result.
 
     Uses SerpApi's explicit position when available.
     """
-    organic = data.get("organic_results") or []
+    organic = data.get(
+        "organic_results"
+    ) or []
 
     target_rank = ""
     expected_rank = ""
     target_urls = []
 
-    for idx, result in enumerate(organic, start=1):
-        if not isinstance(result, dict):
+    for idx, result in enumerate(
+        organic,
+        start=1,
+    ):
+        if not isinstance(
+            result,
+            dict,
+        ):
             continue
 
-        link = result.get("link") or ""
-        position = result.get("position", idx)
+        link = result.get(
+            "link"
+        ) or ""
 
-        if domain_in_url(link, TARGET_DOMAIN):
-            target_urls.append(link)
+        position = result.get(
+            "position",
+            idx,
+        )
+
+        if domain_in_url(
+            link,
+            TARGET_DOMAIN,
+        ):
+            target_urls.append(
+                link
+            )
 
             if target_rank == "":
                 target_rank = position
 
-        if expected_rank == "" and url_matches_expected(
-            link, expected_url
+        if (
+            expected_rank == ""
+            and url_matches_expected(
+                link,
+                expected_url,
+            )
         ):
             expected_rank = position
 
     return {
         "Target Website Present": (
-            "Yes" if target_rank != "" else "No"
+            "Yes"
+            if target_rank != ""
+            else "No"
         ),
-        "Target Website Rank": target_rank,
+
+        "Target Website Rank": (
+            target_rank
+        ),
+
         "Expected URL Present": (
-            "Yes" if expected_rank != "" else "No"
+            "Yes"
+            if expected_rank != ""
+            else "No"
         ),
-        "Expected URL Rank": expected_rank,
-        "Target URLs in Top 20": " | ".join(target_urls),
+
+        "Expected URL Rank": (
+            expected_rank
+        ),
+
+        "Target URLs in Top 20": (
+            " | ".join(target_urls)
+        ),
     }
+
 
 # Entity clustering
 
@@ -432,65 +673,130 @@ def build_clusters(rows):
     clusters = defaultdict(list)
 
     for row in rows:
-        mid = (row.get("KG MID") or "").strip()
+        mid = (
+            row.get("KG MID") or ""
+        ).strip()
 
         if mid:
-            clusters[mid].append(row)
+            clusters[mid].append(
+                row
+            )
 
     output = []
 
-    for mid, members in sorted(clusters.items()):
+    for mid, members in sorted(
+        clusters.items()
+    ):
         first = members[0]
 
         entities = sorted({
-            m.get("Entity", "").strip()
+            m.get(
+                "Entity",
+                "",
+            ).strip()
             for m in members
-            if m.get("Entity", "").strip()
+            if m.get(
+                "Entity",
+                "",
+            ).strip()
         })
 
         queries = [
-            m.get("Query", "").strip()
+            m.get(
+                "Query",
+                "",
+            ).strip()
             for m in members
-            if m.get("Query", "").strip()
+            if m.get(
+                "Query",
+                "",
+            ).strip()
         ]
 
         output.append({
             "KG MID": mid,
-            "KG Title": first.get("KG Title", ""),
-            "KG Type": first.get("KG Type", ""),
-            "KG Entity Type": first.get("KG Entity Type", ""),
-            "KG Website": first.get("KG Website", ""),
-            "KG Place ID": first.get("KG Place ID", ""),
-            "KG Source": first.get("KG Source", ""),
-            "Query Count": len(members),
-            "Entities": " | ".join(entities),
-            "Queries": " | ".join(queries),
+
+            "KG Title": first.get(
+                "KG Title",
+                "",
+            ),
+
+            "KG Type": first.get(
+                "KG Type",
+                "",
+            ),
+
+            "KG Entity Type": first.get(
+                "KG Entity Type",
+                "",
+            ),
+
+            "KG Website": first.get(
+                "KG Website",
+                "",
+            ),
+
+            "KG Place ID": first.get(
+                "KG Place ID",
+                "",
+            ),
+
+            "KG Source": first.get(
+                "KG Source",
+                "",
+            ),
+
+            "Query Count": len(
+                members
+            ),
+
+            "Entities": (
+                " | ".join(entities)
+            ),
+
+            "Queries": (
+                " | ".join(queries)
+            ),
         })
 
     return output
 
 
-def write_clusters(rows, path):
+def write_clusters(
+    rows,
+    path,
+):
     """Write the MID/entity-cluster report."""
-    clusters = build_clusters(rows)
+    clusters = build_clusters(
+        rows
+    )
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
         writer = csv.DictWriter(
             f,
             fieldnames=CLUSTER_FIELDS,
         )
+
         writer.writeheader()
-        writer.writerows(clusters)
+        writer.writerows(
+            clusters
+        )
 
     return clusters
+
 
 # Main
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Measure Google Knowledge Graph/entity resolution "
-            "using SerpApi SERP data."
+            "Measure Google Knowledge Graph/entity "
+            "resolution using SerpApi SERP data."
         )
     )
 
@@ -510,20 +816,30 @@ def main():
         "--limit",
         type=int,
         default=0,
-        help="Process only the first N queries (0 = all)",
+        help=(
+            "Process only the first N queries "
+            "(0 = all)"
+        ),
     )
 
     parser.add_argument(
         "--no-resume",
         action="store_true",
-        help="Ignore existing results and start fresh",
+        help=(
+            "Ignore existing results and "
+            "start fresh"
+        ),
     )
 
     args = parser.parse_args()
 
     input_csv = args.input
     results_dir = args.results_dir
-    raw_dir = os.path.join(results_dir, "raw_json")
+
+    raw_dir = os.path.join(
+        results_dir,
+        "raw_json",
+    )
 
     output_csv = os.path.join(
         results_dir,
@@ -535,25 +851,39 @@ def main():
         "entity_clusters_by_mid.csv",
     )
 
-    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(
+        raw_dir,
+        exist_ok=True,
+    )
 
-    queries = read_queries(input_csv)
+    queries = read_queries(
+        input_csv
+    )
 
     if args.limit:
-        queries = queries[:args.limit]
+        queries = queries[
+            :args.limit
+        ]
 
-    print(f"Loaded {len(queries)} queries from {input_csv}")
+    print(
+        f"Loaded {len(queries)} queries "
+        f"from {input_csv}"
+    )
 
     resume = not args.no_resume
+
     done = (
-        load_done_queries(output_csv)
+        load_done_records(
+            output_csv
+        )
         if resume
         else set()
     )
 
     if done:
         print(
-            f"Resume: {len(done)} queries already recorded; "
+            f"Resume: {len(done)} records "
+            "already recorded; "
             "they will be skipped."
         )
 
@@ -561,17 +891,33 @@ def main():
     # both old and newly collected results.
     existing_rows = []
 
-    if resume and os.path.exists(output_csv):
+    if (
+        resume
+        and os.path.exists(output_csv)
+    ):
         with open(
             output_csv,
             newline="",
             encoding="utf-8",
         ) as f:
-            existing_rows = list(csv.DictReader(f))
+            existing_rows = list(
+                csv.DictReader(f)
+            )
 
-    file_mode = "a" if (resume and os.path.exists(output_csv)) else "w"
+    file_mode = (
+        "a"
+        if (
+            resume
+            and os.path.exists(
+                output_csv
+            )
+        )
+        else "w"
+    )
 
-    collected_rows = list(existing_rows)
+    collected_rows = list(
+        existing_rows
+    )
 
     with open(
         output_csv,
@@ -587,26 +933,51 @@ def main():
         if file_mode == "w":
             writer.writeheader()
 
-        for i, item in enumerate(queries, start=1):
-            entity = item["Entity"]
-            query = item["Query"]
-            expected_website = item["Expected Website"]
+        for i, item in enumerate(
+            queries,
+            start=1,
+        ):
+            entity = item[
+                "Entity"
+            ]
 
-            if query in done:
+            query = item[
+                "Query"
+            ]
+
+            expected_website = item[
+                "Expected Website"
+            ]
+
+            key = record_key(
+                entity,
+                query,
+                expected_website,
+            )
+
+            if key in done:
                 print(
-                    f"[{i}/{len(queries)}] SKIP (done): {query}"
+                    f"[{i}/{len(queries)}] "
+                    f"SKIP (done): {query}"
                 )
                 continue
 
-            print(f"[{i}/{len(queries)}] {query}")
+            print(
+                f"[{i}/{len(queries)}] "
+                f"{query}"
+            )
 
             try:
-                serp = get_serp(query)
+                serp = get_serp(
+                    query
+                )
 
                 # Save complete raw SERP JSON.
                 raw_path = os.path.join(
                     raw_dir,
-                    safe_filename(query) + ".json",
+                    safe_filename(
+                        query
+                    ) + ".json",
                 )
 
                 with open(
@@ -621,8 +992,14 @@ def main():
                         ensure_ascii=False,
                     )
 
-                kg = extract_kg(serp)
-                organic = extract_organic(serp)
+                kg = extract_kg(
+                    serp
+                )
+
+                organic = extract_organic(
+                    serp
+                )
+
                 ranks = extract_ranks(
                     serp,
                     expected_website,
@@ -631,36 +1008,56 @@ def main():
                 row = {
                     "Entity": entity,
                     "Query": query,
-                    "Expected Website": expected_website,
+                    "Expected Website": (
+                        expected_website
+                    ),
                     **kg,
                     **ranks,
                     **organic,
                     "Search Date": now_iso(),
                 }
 
-                writer.writerow(row)
+                writer.writerow(
+                    row
+                )
+
                 f.flush()
 
-                collected_rows.append(row)
+                collected_rows.append(
+                    row
+                )
 
-                mid = row["KG MID"]
+                # Add the record to the in-memory
+                # completed set so duplicate records
+                # later in the same input are skipped.
+                done.add(key)
+
+                mid = row[
+                    "KG MID"
+                ]
 
                 if mid:
                     print(
                         f"  KG MID: {mid} | "
-                        f"Title: {row['KG Title']}"
+                        f"Title: "
+                        f"{row['KG Title']}"
                     )
                 else:
-                    print("  KG MID: none")
+                    print(
+                        "  KG MID: none"
+                    )
 
             except Exception as exc:
                 print(
-                    f"  ! Error on '{query}': {exc}"
+                    f"  ! Error on "
+                    f"'{query}': {exc}"
                 )
 
-            # One SERP request per query.
+            # One normal SERP request per query.
             if i < len(queries):
-                time.sleep(SECONDS_BETWEEN)
+                time.sleep(
+                    SECONDS_BETWEEN
+                )
 
     clusters = write_clusters(
         collected_rows,
@@ -668,11 +1065,18 @@ def main():
     )
 
     print("\nDone.")
-    print(f"  Results:  {output_csv}")
-    print(f"  Clusters: {cluster_csv}")
-    print(f"  Raw JSON: {raw_dir}")
     print(
-        f"  Distinct MIDs observed: {len(clusters)}"
+        f"  Results:  {output_csv}"
+    )
+    print(
+        f"  Clusters: {cluster_csv}"
+    )
+    print(
+        f"  Raw JSON: {raw_dir}"
+    )
+    print(
+        f"  Distinct MIDs observed: "
+        f"{len(clusters)}"
     )
 
 
